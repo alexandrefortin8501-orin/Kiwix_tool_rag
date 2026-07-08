@@ -1,0 +1,233 @@
+import requests
+import re
+import asyncio
+from bs4 import BeautifulSoup as Soup
+from urllib.parse import quote
+from pydantic import BaseModel, Field
+from typing import Callable, Any
+
+
+# ==========================================
+# 1. Outil de Nettoyage HTML (Validé)
+# ==========================================
+class KiwixCleaner:
+    def __init__(self):
+        self.useless_tags = [
+            "script",
+            "style",
+            "nav",
+            "footer",
+            "header",
+            "aside",
+            "sup",
+            "svg",
+            "button",
+        ]
+
+    def clean_html(self, raw_html: str) -> str:
+        if not raw_html or "Failed to retrieve" in raw_html:
+            return ""
+
+        soup = Soup(raw_html, "html.parser")
+        for tag in soup(self.useless_tags):
+            tag.decompose()
+
+        text = soup.get_text(separator=" \n ")
+        text = re.sub(r"\[\w+\s*.*?\]", "", text)
+        text = re.sub(r"http[s]?://\S+", "", text)
+        text = text.replace("\xa0", " ").replace("\t", " ")
+
+        lines = [line.strip() for line in text.split("\n")]
+        cleaned_lines = [re.sub(r" +", " ", line) for line in lines if line]
+
+        return "\n".join(cleaned_lines)
+
+
+# ==========================================
+# 2. Outil de Chunking Intelligent (Validé)
+# ==========================================
+class KiwixChunker:
+    def __init__(self, max_tokens=400, overlap_lines=2):
+        self.max_tokens = max_tokens
+        self.overlap_lines = overlap_lines
+
+    def _estimate_tokens(self, text: str) -> int:
+        return len(text) // 4
+
+    def chunk_text(self, text: str) -> list[str]:
+        lines = text.split("\n")
+        chunks = []
+        current_chunk_lines = []
+        current_tokens = 0
+
+        for line in lines:
+            line_tokens = self._estimate_tokens(line)
+
+            if current_tokens + line_tokens > self.max_tokens and current_chunk_lines:
+                chunks.append("\n".join(current_chunk_lines))
+                overlap = (
+                    current_chunk_lines[-self.overlap_lines :]
+                    if self.overlap_lines > 0
+                    else []
+                )
+                current_chunk_lines = overlap + [line]
+                current_tokens = sum(
+                    self._estimate_tokens(l) for l in current_chunk_lines
+                )
+            else:
+                current_chunk_lines.append(line)
+                current_tokens += line_tokens
+
+        if current_chunk_lines:
+            chunks.append("\n".join(current_chunk_lines))
+
+        return chunks
+
+
+# ==========================================
+# 3. OPEN WEBUI TOOL INTEGRATION
+# ==========================================
+class Tools:
+    class Valves(BaseModel):
+        KIWIX_BASE_URL: str = Field(
+            default="http://192.168.**.***",
+            description="The base URL of the local Kiwix server.",
+        )
+        DEFAULT_BOOK: str = Field(
+            default="wikipedia_en_all_maxi_2026-02",
+            description="The default ZIM book ID to search in if not specified.",
+        )
+        RESULTS_LIMIT: int = Field(
+            default=2, description="Number of articles to fetch and process per query."
+        )
+        CHUNK_MAX_TOKENS: int = Field(
+            default=500, description="Maximum tokens per text chunk sent to the LLM."
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.headers = {"User-Agent": "Mozilla/5.0 (RAG-Edge-Client/1.0)"}
+        self.cleaner = KiwixCleaner()
+
+    async def search_kiwix(
+        self,
+        query: str,
+        book: str = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Search for general knowledge, history, or science definitions within the local Wikipedia Kiwix server.
+
+        :param query: The search keywords. Keep them concise and technically precise.
+        :param book: Optional. The EXACT ZIM book ID to search in. If you do not know the exact ZIM ID, you MUST leave this parameter empty/null.
+        :return: A structured, chunked text extracted from the most relevant article.
+        """
+        target_book = book if book else self.valves.DEFAULT_BOOK
+        book_clean = target_book.strip().rstrip(".zim")
+        safe_query = quote(query)
+        kiwix_url = self.valves.KIWIX_BASE_URL.rstrip("/")
+
+        search_url = f"{kiwix_url}/search?books.name={book_clean}&pattern={safe_query}"
+
+        # 1. Emission du statut : Recherche en cours
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": "in_progress",
+                        "description": f"Recherche de '{query}' dans {book_clean}...",
+                        "done": False,
+                    },
+                }
+            )
+
+        # 2. Requête de recherche (Section A)
+        try:
+            response = requests.get(search_url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+        except Exception as e:
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "status": "error",
+                            "description": f"Erreur de connexion au serveur Kiwix.",
+                            "done": True,
+                        },
+                    }
+                )
+            return f"Erreur lors de la recherche sur le serveur local : {e}"
+
+        soup = Soup(response.text, "html.parser")
+        results = soup.find_all("li")[: self.valves.RESULTS_LIMIT]
+
+        if not results:
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "status": "complete",
+                            "description": "Aucun résultat trouvé.",
+                            "done": True,
+                        },
+                    }
+                )
+            return "Aucun document correspondant n'a été trouvé dans la base de données locale."
+
+        final_context = f"Contexte extrait pour la recherche '{query}':\n\n"
+        chunker = KiwixChunker(max_tokens=self.valves.CHUNK_MAX_TOKENS, overlap_lines=2)
+
+        # 3. Téléchargement et Traitement (Section B)
+        for li in results:
+            a_tag = li.find("a")
+            if not a_tag:
+                continue
+
+            title = a_tag.text.strip()
+            page_url = f"{kiwix_url}{a_tag['href']}"
+
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "status": "in_progress",
+                            "description": f"Extraction et nettoyage de l'article : {title}...",
+                            "done": False,
+                        },
+                    }
+                )
+
+            try:
+                page_response = requests.get(page_url, headers=self.headers, timeout=10)
+                if page_response.status_code == 200:
+                    # Nettoyage
+                    clean_text = self.cleaner.clean_html(page_response.text)
+                    # Découpage
+                    chunks = chunker.chunk_text(clean_text)
+
+                    final_context += f"--- DEBUT DOCUMENT : {title} ---\n"
+                    # On limite à l'envoi des 3 premiers chunks pour ne pas saturer le modèle
+                    for i, chunk in enumerate(chunks[:3]):
+                        final_context += f"[Chunk {i+1}]\n{chunk}\n\n"
+                    final_context += f"--- FIN DOCUMENT : {title} ---\n\n"
+            except Exception:
+                continue
+
+        # 4. Fin de l'opération
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": "complete",
+                        "description": f"Extraction terminée avec succès.",
+                        "done": True,
+                    },
+                }
+            )
+
+        return final_context
